@@ -1,6 +1,6 @@
 /*
- * program -    smallsh
- * author -     Nicholas Olson
+ * program  -   smallsh
+ * author   -   Nicholas Olson
  */
 
 /*** includes ***/
@@ -12,6 +12,9 @@
 #include <sys/types.h>  // for opening
 #include <fcntl.h>      // for opening
 #include <sys/stat.h>   // for opening
+#include <signal.h>     // for signal control
+#include <sys/wait.h>   // for sigchld
+#include <sys/resource.h> // for sigchld
 
 
 /*** defines ***/
@@ -19,6 +22,13 @@
 #define CL_ARGS_SIZE 512
 #define IN_BUFF_SIZE 2048
 #define PWD_BUFF_SIZE 100
+
+
+/*** the two required global variables ***/
+int bg_block_mode_changed = 0;
+int signal_received = 0;
+int bg_block_mode = 0;
+int is_child = 0;
 
 
 /*** structs ***/
@@ -39,6 +49,18 @@ struct CL {
     int pid_size;
     int pid_len;
     int * pids;
+
+    // fg process status
+    int fg_status;
+    int fg_signaled;
+    int fg_exited;
+
+    // is child process
+    int is_child;
+
+    // path contents
+    char ** path;
+    int path_len;
 };
 
 
@@ -59,13 +81,17 @@ int _print(char*, FILE*);               // print string to file pointer passed
 int _grow_CL_pwd_buff(struct CL*);      // grow the size of the pwd buffer
 int _change_CL_pwd(struct CL*, char*);  // change the pwd member of CL to passed str
 int _set_curr_pwd(struct CL*);          // change pwd string to cwd
-int _push_pid(struct CL*, int);              // add pid to the list of running processes
+int _get_path(struct CL*);              // fill the path member of the CL
+int _push_pid(struct CL*, int);         // add pid to the list of running processes
 int _remove_pid(struct CL*, int);       // remove a pid of the given value from arr
+void _sigint_handler(int signum);       // act on sigint during shell operation
+void _sigtstp_handler(int signum);      // act on sigtstp during shell operation
+
 
 /*** built-in prototypes ***/
-int _CL_exit(FILE*, FILE*, int, char**, pthread_t*);            // exit command
-int _CL_cd(FILE*, FILE*, int, char**, pthread_t*, struct CL*);  // cd command
-int _CL_status(FILE*, FILE*, int, char**, pthread_t*);          // status command
+int _CL_exit();                         // exit command
+int _CL_cd(int, char**, struct CL*);    // cd command
+int _CL_status(struct CL*);             // status command
 
 
 /*** interface methods ***/
@@ -83,12 +109,20 @@ int setup_CL(struct CL * cl)
     cl->num_args = 0;
     cl->pid_len = 0;
     cl->pid_size = 5;
+    cl->fg_status = 0;
+    cl->is_child = 0;
+    cl->fg_signaled = 0;
+    cl->fg_exited = 1;
+    cl->path_len = 0;
 
     // mallocs
     cl->buffer = malloc(CL_BUFF_SIZE * sizeof(char));
     cl->args = malloc(CL_ARGS_SIZE * sizeof(char*));
     cl->pwd = malloc(cl->pwd_size * sizeof(char));
     cl->pids = malloc(cl->pid_size * sizeof(int));
+
+    // read path
+    _get_path(cl);
 
     // set initial pwd
     _set_curr_pwd(cl);
@@ -107,11 +141,18 @@ int free_CL(struct CL * cl)
         free(cl->args[i]);
     }
 
+    // only done for malloc'd paths
+    for (i = 0; i < cl->path_len; i++)
+    {
+        free(cl->path[i]);
+    }
+
     // frees
     free(cl->buffer);
     free(cl->args);
     free(cl->pids);
     free(cl->pwd);
+    free(cl->path);
 }
 
 /* parse and execute command in "input" using CL struct "cl"
@@ -137,16 +178,28 @@ int run_CL(struct CL * cl, char * input)
 /* get user input and put it in provided buffer */
 int get_input(char * buffer, int buffer_size)
 {
+   /* 
+    // flush input
+    fflush(stdout);
+    fflush(stdin);
+    */
+    
     // printf PS1 string
+    fflush(stdout);
     printf(": ");
+    fflush(stdout);
 
     // get input
-    fgets(buffer, buffer_size, stdin);
+    if (fgets(buffer, buffer_size, stdin) == NULL) { return 1; };
 
     // trim the newline
     strtok(buffer, "\n");
 
+    // flush input
+    fflush(stdin);
+
     // that's it, it's pretty simple
+    return 0;
 }
 
 /* clear the command line struct back to default state */
@@ -171,14 +224,50 @@ int pid_check_CL(struct CL * cl)
     int result;
     int i;
 
+    // check for bg blocking mode change
+    if (bg_block_mode_changed == 1)
+    {
+        if (bg_block_mode == 1)
+        {
+            fputs("\nEntering foreground-only mode (& is now ignored)\n", stdout);
+        }
+        else if (bg_block_mode == 0)
+        {
+            fputs("\nExiting foreground-only mode\n", stdout);
+        }
+        bg_block_mode_changed = 0;
+    }
+
     for(i = 0; i < cl->pid_len; i++)
     {
         // get whether bg process has exited
-        pid_t cpid = waitpid(cl->pids[i], &result, WNOHANG);
+        pid_t cpid = 0;
+        result = 0;
+        cpid = waitpid(cl->pids[i], &result, WNOHANG);
+        //cpid = waitpid(cl->pids[i], &result, WNOHANG);
+        /*if (errno == ECHILD) printf("does not exist\n");
+        if (errno == EINVAL) printf("bad options\n");
+        if (errno == ENOSYS) printf("bad pid\n");*/
 
-        if (WIFEXITED(result))
+        /*
+        printf("Stored pid = \"%d\"\n", cl->pids[i]);
+        printf("Waitpid result =  \"%d\"\n", cpid);
+        printf("Status = %d\n", result);
+        printf("WIFEXITED = %d\n", WIFEXITED(result));*/
+        if (cpid != 0 && WIFEXITED(result))
         {
-            printf("Child %d terminated with status %d\n", cl->pids[i], WEXITSTATUS(result));
+            fflush(stdout);
+            printf("background pid %d is done: exit value %d\n",
+                        cl->pids[i], WEXITSTATUS(result));
+            fflush(stdout);
+            _remove_pid(cl, cl->pids[i]);
+        }
+        else if (cpid != 0 && WIFSIGNALED(result))
+        {
+            fflush(stdout);
+            printf("\nbackground pid %d is done: terminated by signal %d\n",
+                        cl->pids[i], WTERMSIG(result));
+            fflush(stdout);
             _remove_pid(cl, cl->pids[i]);
         }
     }
@@ -193,6 +282,7 @@ int _parse_input(struct CL * cl, char * input)
     // declarations
     int start = 0;
     int end = 0;
+    int i = 0;
     int len;
 
     // copy input into buffer
@@ -222,6 +312,35 @@ int _parse_input(struct CL * cl, char * input)
                 if (end == len - 1) { end++; }
                 cl->args[cl->num_args] = malloc((end - start + 1) * sizeof(char));
                 sprintf(cl->args[cl->num_args], "%.*s\0", (end - start), (cl->buffer + start));
+
+                // check for $$
+                char * wow = strstr(cl->args[cl->num_args], "$$");
+                if (wow != NULL)
+                {
+                    // get pid
+                    pid_t pid = getpid();
+                    char pid_buff[100]; // RIP pids longer than 100 digits
+                    sprintf(pid_buff, "%d\0", pid);
+
+                    // copy arg into tmp
+                    char * tmp = malloc((end - start + 1) * sizeof(char));
+                    strcpy(tmp, cl->args[cl->num_args]);
+
+                    // cut-off string before &&
+                    wow = tmp + (wow - cl->args[cl->num_args]);
+                    wow[0] = '\0';
+
+                    // re-allocate arg buffer
+                    free(cl->args[cl->num_args]);
+                    cl->args[cl->num_args] = malloc((strlen(pid_buff)+(end-start+1))*sizeof(char));
+
+                    // compile full string 
+                    sprintf(cl->args[cl->num_args], "%s%s%s", tmp, pid_buff, (wow+2));
+
+                    // free tmp
+                    free(tmp);
+                }
+
                 cl->num_args += 1;
             }
 
@@ -252,166 +371,253 @@ int _execute_CL(struct CL * cl)
     int special_count = 0;
     int result = 0;
     int i = 0;
+    int j = 0;
 
-    // check if command was not empty
+    // if command was empty
     if (cl->num_args == 0) { return 0; }
 
-    // if exit
+    // if exit (save the time of parsing)
     if (strcmp(cl->args[0], "exit") == 0) { return -1; }
 
-    // special argument vars
-    special_count = 0;
-
     // check for special args
-    if (strcmp(cl->args[cl->num_args - 1], "&") == 0)
-    {
-        // open in background
-        special_count += 1;
+    if (_process_special_args(cl, &special_count,
+                        &in_stream, &out_stream,
+                        &in_redir, &out_redir, &background) != 0)
+    { return 0; }
 
-        // background ( redir can be overwritten )
-        in_stream = open("/dev/null", O_RDONLY);
-        out_stream = open("/dev/null", O_WRONLY);
-        in_redir = 1;
-        out_redir = 1;
-        background = 1;
-    }
-    for (i = 0; i < cl->num_args; i++)
-    {
-        if (strcmp(cl->args[i], "<") == 0)
-        {
-            // new input file
-            special_count += 2;
-
-            // if background or already redir'd, close the old one
-            if (background || in_redir) { close(in_stream); }
-
-            // "<" is not last arg
-            in_stream = open(cl->args[i+1], O_RDONLY);
-            in_redir = 1;
-        }
-        else if (strcmp(cl->args[i], ">") == 0)
-        {
-            // new output file
-            special_count += 2;
-           
-            // if background or already redir'd, close the old one
-            if (background || out_redir) { close(out_stream); }
-
-            // ">" is not last arg
-            out_stream = open(cl->args[i+1], O_WRONLY | O_TRUNC | O_CREAT, S_IRWXU);
-            out_redir = 1;
-        }
-        else if (strcmp(cl->args[i], ">>") == 0)
-        {
-            // new output file (append)
-            special_count += 2;
-            
-            // if background or already redir'd, close the old one
-            if (background || out_redir) { close(out_stream); }
-            
-            // ">>" is not last arg
-            out_stream = open(cl->args[i+1], O_WRONLY | O_APPEND | O_CREAT, S_IRWXU);
-            out_redir = 1;
-        }
-    }
-
-    pthread_t pid_wow;
-    pthread_t * pid = &pid_wow;
-
-    // ignore special
+    // don't pass special arguments in
     char * tmp = cl->args[cl->num_args - special_count];
     cl->args[cl->num_args - special_count] = NULL;
-
-    // run program
-    result = 0; 
-    i = fork();
-
-    if (i > 0)
-    {
-        if (!background) { waitpid(i); } // parent wait
-        else
-        {
-            printf("Child %d started\n", i);
-            _push_pid(cl, i);
-        } // parent not wait
-    }
-    else if (i == 0)
-    {
-        // redirect stuff
-        if (in_redir)  { saved_in = dup(STDIN_FILENO); 
-                         dup2(in_stream, STDIN_FILENO); }
-        if (out_redir) { fflush(stdout);
-                         saved_out = dup(STDOUT_FILENO);
-                         dup2(out_stream, STDOUT_FILENO); }
         
-        if (strcmp(cl->args[0], "cd") == 0)
-        {
-            result = _CL_cd(in_stream, out_stream,
-                            (cl->num_args - special_count),
-                            cl->args, pid, cl);
-        }
-        else if (strcmp(cl->args[0], "exit") == 0)
-        {
-            result = _CL_exit(in_stream, out_stream,
-                                (cl->num_args - special_count),
-                                cl->args, pid);
-        }
-        else if (strcmp(cl->args[0], "status") == 0)
-        {
-            result = _CL_status(in_stream, out_stream,
-                                (cl->num_args - special_count),
-                                cl->args, pid);
-        }
-        else
-        {
-            // not a built-in
-            execvp(cl->args[0], cl->args);
-            result = -1; // only reached if execvp failed
-        }
+    // execute built-in commands
+    if (strcmp(cl->args[0], "cd") == 0)
+        { _CL_cd((cl->num_args - special_count), cl->args, cl); }
+    else if (strcmp(cl->args[0], "exit") == 0)
+        { _CL_exit(); }
+    else if (strcmp(cl->args[0], "status") == 0)
+        { _CL_status(cl); }
 
-        // close streams
-        if (in_redir)  { close(in_stream);
-                         dup2(STDIN_FILENO, saved_in);
-                         close(saved_in); }
-        if (out_redir) { close(out_stream); 
-                         dup2(STDOUT_FILENO, saved_out);
-                         close(saved_out); }
-    } // child thing
+    // execute non built-ins
+    else {
+        // fork process
+        result = 0; 
+        signal(SIGINT, _sigint_handler);
+        i = fork();
 
-    // put old special args back
+        // if parent process
+        if (i > 0)
+        {
+            // is parent
+            cl->is_child = 0;
+            is_child = 0;
+
+            // status var
+            int status = 0;
+
+            // background process
+            if (background)
+            {
+                signal(SIGINT, SIG_IGN);
+                
+                fflush(stdout);
+                printf("background pid is %d\n", i);
+                fflush(stdout);
+                _push_pid(cl, i);
+            }
+            // foreground process
+            else
+            {
+                fflush(stdout);
+
+                j = 0;
+                is_child = 1;
+                while (j == 0) { j = waitpid(i, &status, WNOHANG); }
+                //while (j == 0) { j = waitpid(i, &status, WNOHANG); }
+                is_child = 0;
+
+                signal(SIGINT, _sigint_handler);
+
+                /*
+                printf("j = %d\n", j);
+                printf("status = %d\n", status);
+                printf("WIFSIGNALED = %d\n", WIFSIGNALED(status));
+                printf("WIFEXITED = %d\n", WIFEXITED(status));
+                */
+
+                // if child was not built-in
+                if (status != 0)
+                {
+                    if (WIFSIGNALED(status))
+                    {
+                        cl->fg_status = WTERMSIG(status);
+                        cl->fg_exited = 0;
+                        cl->fg_signaled = 1;
+                    }
+                    else if (WIFEXITED(status))
+                    {
+                        cl->fg_status = WEXITSTATUS(status);
+                        cl->fg_exited = 1;
+                        cl->fg_signaled = 0;
+                    }
+                }
+            }
+            
+            signal(SIGINT, SIG_IGN);
+        }
+        // if forked child process
+        else if (i == 0)
+        {
+            // is child
+            cl->is_child = 1;
+            is_child = 1;
+
+            // redirect input and output
+            if (in_redir)  { saved_in = dup(STDIN_FILENO); 
+                             dup2(in_stream, STDIN_FILENO); }
+            if (out_redir) { fflush(stdout);
+                             saved_out = dup(STDOUT_FILENO);
+                             dup2(out_stream, STDOUT_FILENO); }
+            
+            // always ignore sigtstp
+            signal(SIGTSTP, SIG_IGN);
+
+            // ignore sigint if in background
+            if (background) { signal(SIGINT, SIG_IGN); }
+            else            { signal(SIGINT, _sigint_handler); }
+
+            // not a built-in command
+            for (j = 0; j < cl->path_len; j++)
+            {
+                char * path_tmp = malloc((strlen(cl->args[0]) + strlen(cl->path[j]) + 2) * sizeof(char));
+                sprintf(path_tmp, "%s/%s", cl->path[j], cl->args[0]);
+                execv(path_tmp, cl->args);
+                //execvp(cl->args[0], cl->args);
+                free(path_tmp);
+            }
+
+            perror("\0");
+
+            // following is only reached if execvp failed
+            cl->fg_status = 1;
+            result = -1;
+            
+            // close streams
+            if (in_redir)  { close(in_stream);
+                             dup2(STDIN_FILENO, saved_in);
+                             close(saved_in); }
+            if (out_redir) { close(out_stream); 
+                             dup2(STDOUT_FILENO, saved_out);
+                             close(saved_out); }
+
+        } // child thing
+    }
+
+    // put old special arguments back
     cl->args[cl->num_args - special_count] = tmp;
 
     // return
     return result;
 }
 
-/* print string to file pointer if provided */
-int _print(char * str, FILE * dest)
+/* check the argument list for special arguments (redirection / bg)
+ * pre-condition:   cl setup and parsed
+ * post-condition:  flags and streams passed are updated */
+_process_special_args(struct CL * cl, int * special_count,
+                      int * in_stream, int * out_stream,
+                      int * in_redir, int * out_redir,
+                      int * background)
 {
-    // background, don't print
-    if (dest == NULL)
-    {
-        return 0;
-    }
-    else
-    {
-        // flush
-        fflush(dest);
+    // declarations
+    int i;
 
-        // stdout, normal print
-        if (dest == stdout)
-        {
-            printf(str);
-        }
-        // redirected
-        else
-        {
-            fprintf(dest, str);
-        }
+    // initial values
+    *in_stream = STDIN_FILENO;
+    *out_stream = STDOUT_FILENO;
+    *special_count = 0;
+    *background = 0;
+    *out_redir = 0;
+    *in_redir = 0;
 
-        // flush
-        fflush(dest);
+    // check for background first
+    if (strcmp(cl->args[cl->num_args - 1], "&") == 0)
+    {
+        // open in background
+        *special_count += 1;
+
+        // background ( redir can be overwritten )
+        if (bg_block_mode == 0)
+        {
+            *in_stream = open("/dev/null", O_RDONLY);
+            *out_stream = open("/dev/null", O_WRONLY);
+            *in_redir = 1;
+            *out_redir = 1;
+            *background = 1;
+        }
     }
+
+    // check for redirection special args
+    for (i = 0; i < cl->num_args; i++)
+    {
+        if (strcmp(cl->args[i], "<") == 0)
+        {
+            // new input file
+            *special_count += 2;
+
+            // if background or already redir'd, close the old one
+            if (*background || *in_redir) { close(*in_stream); }
+
+            // "<" is not last arg
+            *in_stream = open(cl->args[i+1], O_RDONLY);
+            *in_redir = 1;
+
+            // check for open failure
+            if (*in_stream == -1)
+            {
+                perror("\0");
+                return 1;
+            }
+        }
+        else if (strcmp(cl->args[i], ">") == 0)
+        {
+            // new output file
+            *special_count += 2;
+           
+            // if background or already redir'd, close the old one
+            if (*background || *out_redir) { close(*out_stream); }
+
+            // ">" is not last arg
+            *out_stream = open(cl->args[i+1], O_WRONLY | O_TRUNC | O_CREAT, 0600);
+            *out_redir = 1;
+            
+            // check for open failure
+            if (*out_stream == -1)
+            {
+                perror("\0");
+                return 1;
+            }
+        }
+        else if (strcmp(cl->args[i], ">>") == 0)
+        {
+            // new output file (append)
+            *special_count += 2;
+            
+            // if background or already redir'd, close the old one
+            if (*background || *out_redir) { close(*out_stream); }
+            
+            // ">>" is not last arg
+            *out_stream = open(cl->args[i+1], O_WRONLY | O_APPEND | O_CREAT, 0600);
+            *out_redir = 1;
+            
+            // check for open failure
+            if (*out_stream == -1)
+            {
+                perror("\0");
+                return 1;
+            }
+        }
+    }
+
+    return 0;
 }
 
 /* grow the size of the pwd buffer */
@@ -485,6 +691,81 @@ int _set_curr_pwd(struct CL * cl)
     free(tmp);
 }
 
+/* parse current PATH var into cl members */
+int _get_path(struct CL * cl)
+{
+    // declarations
+    const char * c_tmp;
+    int tmp_size = 10;
+    int tmp_len = 0;
+    char * tmp;
+    char * tmp2;
+    char * tmp_free;
+    int count = 0;
+    int i;
+
+    // if path has been alloc'd
+    if (cl->path_len != 0)
+    {
+        for (i = 0; i < cl->path_len; i++) { free(cl->path[i]); }
+        free(cl->path);
+        cl->path_len = 0;
+    }
+
+    // get path var
+    c_tmp = getenv("PATH");
+    tmp = malloc((strlen(c_tmp) + 1) * sizeof(char));
+    tmp_free = tmp;
+    strcpy(tmp, c_tmp);
+
+    // get count of ":"
+    tmp2 = tmp;
+    while((tmp2 = strstr(tmp2, ":")) != NULL)
+    {
+       count++;
+       tmp2++;
+    }
+
+    // allocate path arr
+    cl->path_len = count + 1;
+    cl->path = malloc(cl->path_len * sizeof(char *));
+
+    // if path is empty
+    if (strlen(c_tmp) == 0)
+    {
+        free(tmp_free);
+        cl->path[0] = ".";
+        return 1;
+    }
+
+    // for each ":" between paths (tmp is at beginning)
+    count = 0;
+    for (i = 0; i < cl->path_len && tmp != NULL; i++)
+    {
+        // ensure char after curr path is '\0'
+        if ((tmp2 = strstr(tmp, ":")) != NULL)
+        {
+            // set the following ":" to "\0"
+            tmp2[0] = '\0';
+        }
+
+        // allocate current path string
+        cl->path[i] = malloc((strlen(tmp) + 1) * sizeof(char));
+    
+        // copy path into arr
+        strcpy(cl->path[i], tmp);
+
+        // move forward
+        if (tmp2 != NULL) { tmp = tmp2 + 1; }
+        else              { tmp = NULL; }
+
+        //printf("~%d~%s\n", i, cl->path[i]);
+    }
+
+    // cleanup temp
+    free(tmp_free);
+}
+
 /* add pid to the list of background processes */
 int _push_pid(struct CL * cl, int new_pid)
 {
@@ -532,30 +813,100 @@ int _remove_pid(struct CL * cl, int target_pid)
     return 0;
 }
 
+/* act assigned to sigint invocation */
+void _sigint_handler(int signum)
+{
+    // exit process if child
+    //if (is_child) { printf("SIGINT\n"); }
+    //else { printf("\n"); }
+   
+    // flush out
+    fflush(stdout);
+
+    //printf("is_child = %d\n", is_child);
+    //if (is_child) printf("terminated by signal %d\n", signum);
+    
+    //printf("terminated by signal %d\n", signum);
+    fputs("terminated by signal 2\n", stdout);
+
+    //else { printf("\n"); }
+    //signal_received = 1;
+    //if (is_child) signal_received = 1;
+
+    // flush stdin
+    fflush(stdin);
+    fflush(stdout);
+}
+
+/* act assigned to sigchld invocation */
+void _sigchld_handler(int signum)
+{
+}
+
+/* act assigned to sigtstp invocation */
+void _sigtstp_handler(int signum)
+{
+    // toggle background blocking mode
+    if (bg_block_mode == 0)
+    {
+        bg_block_mode = 1;
+        bg_block_mode_changed = 1;
+    }
+    else if (bg_block_mode == 1)
+    {
+        bg_block_mode = 0;
+        bg_block_mode_changed = 1;
+    }
+
+    /*
+    // declaration
+    int i;
+
+    // flush
+    fflush(stdout);
+
+    // wait for children
+    wait(&i);
+
+    // toggle background blocking mode
+    if (bg_block_mode == 0)
+    {
+        bg_block_mode = 1;
+        //printf("\nEntering foreground-only mode (& is now ignored)\n");
+        fputs("\nEntering foreground-only mode (& is now ignored)\n", stdout);
+    }
+    else if (bg_block_mode == 1)
+    {
+        bg_block_mode = 0;
+        //printf("\nExiting foreground-only mode\n");
+        fputs("\nExiting foreground-only mode\n", stdout);
+    }
+    
+    // flush stdin and stdout
+    fflush(stdin);
+    fflush(stdout);
+    */
+}
+
 
 /*** built-ins ***/
 /* built-in exit command (exits the shell) */
-int _CL_exit(FILE * in_stream, FILE * out_stream,
-             int argc, char ** argv, pthread_t * pid)
+int _CL_exit()
 {
-    // lock mutex thread
-
-    /* printing
-    _print("exiting\n", out_stream); */
-
     return -1;
 }
 
 /* built-in cd command (change directory) */
-int _CL_cd(FILE * in_stream, FILE * out_stream,
-           int argc, char ** argv, pthread_t * pid,
-           struct CL * cl)
+int _CL_cd(int argc, char ** argv, struct CL * cl)
 {
     // declarations
     int i;
 
-    // lock mutex thread
-    // *****************
+    // move home
+    if (argc == 1)
+    {
+        chdir(getenv("HOME"));
+    }
 
     // change directory
     for(i = 0; i < argc; i++)
@@ -575,19 +926,33 @@ int _CL_cd(FILE * in_stream, FILE * out_stream,
 }
 
 /* built-in status command (shows shell status) */
-int _CL_status(FILE * in_stream, FILE * out_stream,
-               int argc, char ** argv, pthread_t * pid)
+int _CL_status(struct CL * cl)
 {
-    // lock mutex thread
+    if      (cl->fg_exited)
+    {
+        fflush(stdout);
+        printf("exit value %d\n", cl->fg_status);
+        fflush(stdout);
+    }
+    else if (cl->fg_signaled || signal_received)
+    {
+        fflush(stdout);
+        printf("terminated by signal %d\n", cl->fg_status);
+        fflush(stdout);
+        signal_received = 0;
+    }
     return 0;
 }
+
 
 /*** main ***/
 int main(int argc, char** argv)
 {
+    // declarations
     char * in_buff;
     int keep_going;
     struct CL cl;
+    int result;
     int i;
 
     // malloc input buffer
@@ -596,22 +961,38 @@ int main(int argc, char** argv)
     // setup command line struct
     setup_CL(&cl);
 
+    // declare sigaction structs
+    struct sigaction sigint_action  = {0};
+    struct sigaction sigtstp_action = {0};
+    struct sigaction sigchld_action = {0};
+
+    // set signal handlers
+    sigint_action.sa_handler  = _sigint_handler;
+    sigtstp_action.sa_handler = _sigtstp_handler;
+    sigchld_action.sa_handler = _sigchld_handler;
+
+    // assign signal actions with sigaction
+    //sigaction(SIGINT,  &sigint_action,  NULL);
+    signal(SIGINT, SIG_IGN);
+    sigaction(SIGTSTP, &sigtstp_action, NULL);
+    signal(SIGCHLD, SIG_IGN);
+    //sigaction(SIGCHLD, &sigchld_action, NULL);
+
     // command loop
     keep_going = 0;
-
     while (keep_going == 0)
     {
+        // clear CL
+        clear_CL(&cl);
+
         // check background
         pid_check_CL(&cl);
 
         // get commands
-        get_input(in_buff, IN_BUFF_SIZE);
+        if (get_input(in_buff, IN_BUFF_SIZE) != 0) { continue; };
 
         // run commands
         keep_going = run_CL(&cl, in_buff);
-
-        // clear CL
-        clear_CL(&cl);
     }
 
     // destroy command line
@@ -619,4 +1000,7 @@ int main(int argc, char** argv)
 
     // free input buffer
     free(in_buff);
+
+    // return (last exit status if child)
+    return (cl.is_child) ? (cl.fg_status) : (0);
 }
