@@ -13,8 +13,8 @@
 #include <fcntl.h>      // for opening
 #include <sys/stat.h>   // for opening
 #include <signal.h>     // for signal control
-#include <sys/wait.h>   // for sigchld
-#include <sys/resource.h> // for sigchld
+#include <termios.h>    // for terminal attr control
+#include <ctype.h>      // for iscntrl
 
 
 /*** defines ***/
@@ -61,17 +61,23 @@ struct CL {
     // path contents
     char ** path;
     int path_len;
+
+    // history of commands
+    char ** history;
+    int hist_size;
+    int hist_len;
+    int curr_idx;
 };
 
 
 /*** interface prototypes ***/
-int setup_CL(struct CL*);           // setup CL struct (allocate)
-int free_CL(struct CL*);            // destroy CL struct (free)
-int run_CL(struct CL*, char*);      // parse and execute line of command
-int get_input(char*, int);          // get user input and put it in buffer
-int clear_CL(struct CL*);           // clear CL struct to neutral state
-int pid_check_CL(struct CL*);       // checks the statuses of all bg pids
-int main(int, char**);              // main runtime
+int setup_CL(struct CL*);               // setup CL struct (allocate)
+int free_CL(struct CL*);                // destroy CL struct (free)
+int run_CL(struct CL*, char*);          // parse and execute line of command
+int get_input(struct CL*, char*, int);  // get user input and put it in buffer
+int clear_CL(struct CL*);               // clear CL struct to neutral state
+int pid_check_CL(struct CL*);           // checks the statuses of all bg pids
+int main(int, char**);                  // main runtime
 
 
 /*** hidden prototypes ***/
@@ -86,6 +92,8 @@ int _push_pid(struct CL*, int);         // add pid to the list of running proces
 int _remove_pid(struct CL*, int);       // remove a pid of the given value from arr
 void _sigint_handler(int signum);       // act on sigint during shell operation
 void _sigtstp_handler(int signum);      // act on sigtstp during shell operation
+int _add_to_hist(struct CL*, char*);    // add a command to the command history
+int _grow_history(struct CL*);          // grow history dynarr
 
 
 /*** built-in prototypes ***/
@@ -114,12 +122,16 @@ int setup_CL(struct CL * cl)
     cl->fg_signaled = 0;
     cl->fg_exited = 1;
     cl->path_len = 0;
+    cl->hist_len = 0;
+    cl->hist_size = 10;
+    cl->curr_idx = 0;
 
     // mallocs
     cl->buffer = malloc(CL_BUFF_SIZE * sizeof(char));
     cl->args = malloc(CL_ARGS_SIZE * sizeof(char*));
     cl->pwd = malloc(cl->pwd_size * sizeof(char));
     cl->pids = malloc(cl->pid_size * sizeof(int));
+    cl->history = malloc(cl->hist_size * sizeof(char*));
 
     // read path
     _get_path(cl);
@@ -147,12 +159,19 @@ int free_CL(struct CL * cl)
         free(cl->path[i]);
     }
 
+    // only done for malloc'd history
+    for (i = 0; i < cl->hist_len; i++)
+    {
+        free(cl->history[i]);
+    }
+
     // frees
     free(cl->buffer);
     free(cl->args);
     free(cl->pids);
     free(cl->pwd);
     free(cl->path);
+    free(cl->history);
 }
 
 /* parse and execute command in "input" using CL struct "cl"
@@ -165,7 +184,7 @@ int run_CL(struct CL * cl, char * input)
 {
     // parse into CL
     if (_parse_input(cl, input) != 0) { return 1; }
-    
+
     // execute command
     int result = _execute_CL(cl);
     if (result > 0) { return result; }
@@ -176,31 +195,326 @@ int run_CL(struct CL * cl, char * input)
 }
 
 /* get user input and put it in provided buffer */
-int get_input(char * buffer, int buffer_size)
+int get_input(struct CL * cl, char * buffer, int buffer_size)
 {
-   /* 
-    // flush input
-    fflush(stdout);
-    fflush(stdin);
-    */
-    
+    // declaration
+    struct termios termInfo, save;
+    int curr_len = 0;
+    int saved_out;
+    int null_out;
+    char str[5];
+    int i = 0;
+    int j = 0;
+    int c;
+    int t;
+
+    // setup timeout stuff
+    fd_set rfds;
+    struct timeval tv;
+    int retval;
+    FD_ZERO(&rfds);
+    FD_SET(0, &rfds);
+    tv.tv_sec = 1; // 1 second
+    tv.tv_usec = 0; // 1/10 second
+
+    // move curr_idx to top
+    cl->curr_idx = cl->hist_len;
+
+    // get terminal attributes
+    t = tcgetattr(0, &termInfo);
+
+    // turn echo off
+    termInfo.c_lflag &= ~ECHO; /* turn off ECHO */
+    termInfo.c_lflag &= ~ICANON; /* turn on raw mode */
+
+    // set attributes
+    tcsetattr(0, TCSANOW, &termInfo);
+
+    // stop buffering
+    //setvbuf(stdout, NULL, _IONBF, 0);
+
     // printf PS1 string
     fflush(stdout);
-    printf(": ");
+    fputs(": ", stdout);
     fflush(stdout);
+    //fflush(stdin);
 
+    //t = -1;
     // get input
-    if (fgets(buffer, buffer_size, stdin) == NULL) { return 1; };
+    curr_len = 0;
+    //while ((t != -1) ||
+    //        (c = getchar()) != EOF && c != '\n' && c != '\0' && (i < buffer_size - 1))
+    while ((c = getchar()) != EOF && c != '\n' && c != '\0' && (i < buffer_size - 1))
+    //do
+    {
+        //t = 0;
+        //fflush(stdin);
+        //c = getchar();
+        //scanf("%c", &c);
+        //fflush(stdin);
+
+        // do special stuff
+        if (c == 127) // backspace
+        {
+            // if not at beginning
+            if (i != 0)
+            {
+                // move cursor left
+                printf("%c%c%c", 27, '[', 'D');
+
+                // shift buffer and print
+                for (j = i - 1; j < curr_len - 1; j++)
+                {
+                    buffer[j] = buffer[j+1];
+                    putchar(buffer[j]);
+                }
+                //buffer[curr_len] = '\0';
+                //printf("\n%s\n", buffer);
+
+                // clear last char
+                putchar(' ');
+
+                // move cursor back to where it should be
+                if (curr_len - i + 1 != 0)
+                {
+                    printf("%c%c%c%c", 27, '[', '0' + (curr_len - i + 1), 'D');
+                }
+
+                curr_len--;
+                i--;
+
+                // add null termination
+                buffer[curr_len] = '\0';
+            }
+        }
+        else if (c == 27) // ansi escape sequences
+        {
+            // get rest of escape sequence
+            fgets(str, 3, stdin);
+
+            // handle sequence
+            if (strcmp(str, "[A") == 0) // up arrow
+            {
+                // move earlier in history
+                if (cl->curr_idx != 0)
+                {
+                    // move back
+                    cl->curr_idx--;
+
+                    // copy the thing there
+                    strcpy(buffer, cl->history[cl->curr_idx]);
+
+                    // move cursor back and remove what's there
+                    for (j = 0; j < curr_len; j++)
+                    {
+                        printf("%c%c%c", 27, '[', 'D');
+                        putchar(' ');
+                        printf("%c%c%c", 27, '[', 'D');
+                    }
+
+                    // get len
+                    curr_len = strlen(cl->history[cl->curr_idx]);
+                    i = curr_len;
+
+                    // print command
+                    printf(buffer);
+                }
+            }
+            else if (strcmp(str, "[B") == 0) // down arrow
+            {
+                // move later in history
+                if (cl->curr_idx != cl->hist_len)
+                {
+                    // move forward
+                    cl->curr_idx++;
+
+                    // move cursor back and remove what's there
+                    for (j = 0; j < curr_len; j++)
+                    {
+                        printf("%c%c%c", 27, '[', 'D');
+                        putchar(' ');
+                        printf("%c%c%c", 27, '[', 'D');
+                    }
+
+                    if (cl->curr_idx == cl->hist_len)
+                    {
+                        buffer[0] = '\0';
+                        curr_len = 0;
+                        i = curr_len;
+                    }
+                    else
+                    {
+                        // copy the thing there
+                        strcpy(buffer, cl->history[cl->curr_idx]);
+                        curr_len = strlen(cl->history[cl->curr_idx]);
+                        i = curr_len;
+                    }
+
+                    // print command
+                    printf(buffer);
+
+                }
+            }
+            else if (strcmp(str, "[C") == 0) // right arrow
+            {
+                // move cursor right
+                if (i < curr_len)
+                {
+                    printf("%c%c%c", 27, '[', 'C');
+                    i++;
+                }
+            }
+            else if (strcmp(str, "[D") == 0) // left arrow
+            {
+                // move cursor left
+                if (i != 0)
+                {
+                    printf("%c%c%c", 27, '[', 'D');
+                    i--;
+                }
+            }
+            else
+            {
+                // Unsupported escape sequence
+            }
+        }
+        else
+        {
+            // normal character
+
+            // put new char
+            putchar(c);
+
+            // shift following chars back
+            for (j = curr_len; j > i; j--)
+            {
+                buffer[j] = buffer[j-1];
+            }
+
+            // store char in buff
+            buffer[i] = c;
+
+            // put following chars
+            for (j = i + 1; j <= curr_len; j++)
+            {
+                putchar(buffer[j]);
+            }
+
+            // if not at end, move cursor back
+            if (curr_len - i != 0)
+            {
+                printf("%c%c%c%c", 27, '[', '0' + (curr_len - i), 'D');
+            }
+
+            // add null termination
+            buffer[curr_len+1] = '\0';
+
+            // add to length
+            curr_len++;
+            
+            // move cursor forward            
+            i++;
+        }
+        
+        // flush
+        fflush(stdout);
+    }
+    
+    // get rid of buffered stuff
+    fflush(stdin);
+    
+    // add end of string
+    buffer[curr_len+1] = '\0';
+
+    // newline
+    putchar('\n');
+
+    // turn ECHO back on
+    termInfo.c_lflag |= ECHO; /* turn on ECHO */
+    termInfo.c_lflag |= ICANON; /* turn on raw mode */
+   
+    // set attributes
+    tcsetattr(0, TCSANOW, &termInfo);
+
+    // stop buffering
+    //setvbuf(stdout, NULL, _IOLBF, 0);
 
     // trim the newline
-    strtok(buffer, "\n");
+    //strtok(buffer, "\n");
 
     // flush input
     fflush(stdin);
+
+    // add command to history
+    if (curr_len != 0) { _add_to_hist(cl, buffer); }
+    else { return 2; }
 
     // that's it, it's pretty simple
     return 0;
 }
+
+/* add string to command history
+ * pre-condition:   command has no newline */
+int _add_to_hist(struct CL * cl, char * command)
+{
+    // if command is empty
+    if (command[0] == '\0') { return 1; }
+
+    // if history needs to grow
+    if (cl->hist_len == cl->hist_size - 1) { _grow_history(cl); }
+
+    // malloc new element
+    cl->history[cl->hist_len] = malloc((strlen(command)+1) * sizeof(char));
+
+    // add new element
+    strcpy(cl->history[cl->hist_len], command);
+
+    // increment length
+    cl->hist_len++;
+
+    // move curr_idx
+    cl->curr_idx = cl->hist_len;
+    
+    // return
+    return 0;
+}
+
+/* double size of history array */
+int _grow_history(struct CL * cl)
+{
+    // declarations
+    char ** tmp;
+    int i;
+
+    // copy old elements
+    tmp = malloc(cl->hist_len * sizeof(char*));
+    for (i = 0; i < cl->hist_len; i++)
+    {
+        tmp[i] = cl->history[i];
+    }
+    
+    // free old buff
+    free(cl->history);
+    
+    // double size
+    cl->hist_size *= 2;
+    
+    // malloc new buff
+    cl->history = malloc(cl->hist_size * sizeof(char*));
+    
+    // copy elements in
+    for (i = 0; i < cl->hist_len; i++)
+    {
+        cl->history[i] = tmp[i];
+    }
+    
+    // free tmp
+    free(tmp);
+
+    // return
+    return 0;
+}
+
 
 /* clear the command line struct back to default state */
 int clear_CL(struct CL * cl)
@@ -229,11 +543,11 @@ int pid_check_CL(struct CL * cl)
     {
         if (bg_block_mode == 1)
         {
-            fputs("\nEntering foreground-only mode (& is now ignored)\n", stdout);
+            fputs("Entering foreground-only mode (& is now ignored)\n", stdout);
         }
         else if (bg_block_mode == 0)
         {
-            fputs("\nExiting foreground-only mode\n", stdout);
+            fputs("Exiting foreground-only mode\n", stdout);
         }
         bg_block_mode_changed = 0;
     }
@@ -374,7 +688,7 @@ int _execute_CL(struct CL * cl)
     int j = 0;
 
     // if command was empty
-    if (cl->num_args == 0) { return 0; }
+    if (cl->args[0] == NULL || strcmp(cl->args[0], "\n") == 0) { return 0; }
 
     // if exit (save the time of parsing)
     if (strcmp(cl->args[0], "exit") == 0) { return -1; }
@@ -383,7 +697,18 @@ int _execute_CL(struct CL * cl)
     if (_process_special_args(cl, &special_count,
                         &in_stream, &out_stream,
                         &in_redir, &out_redir, &background) != 0)
-    { return 0; }
+    {
+        /* redirection error */
+        if (!background)
+        {
+            // foreground, set status
+            cl->fg_status = 1;
+            cl->fg_exited = 1;
+            cl->fg_signaled = 0;
+        }
+        
+        return 0;
+    }
 
     // don't pass special arguments in
     char * tmp = cl->args[cl->num_args - special_count];
@@ -422,6 +747,7 @@ int _execute_CL(struct CL * cl)
                 fflush(stdout);
                 printf("background pid is %d\n", i);
                 fflush(stdout);
+
                 _push_pid(cl, i);
             }
             // foreground process
@@ -431,7 +757,8 @@ int _execute_CL(struct CL * cl)
 
                 j = 0;
                 is_child = 1;
-                while (j == 0) { j = waitpid(i, &status, WNOHANG); }
+                status = 0;
+                j = waitpid(i, &status, 0);
                 //while (j == 0) { j = waitpid(i, &status, WNOHANG); }
                 is_child = 0;
 
@@ -444,20 +771,27 @@ int _execute_CL(struct CL * cl)
                 printf("WIFEXITED = %d\n", WIFEXITED(status));
                 */
 
-                // if child was not built-in
-                if (status != 0)
+                // if no waitpid error occurred
+                if (j != -1)//status != 0)
                 {
+                    //printf("~~WAITPID %d\n", j);
                     if (WIFSIGNALED(status))
                     {
+                        //printf("~~SIGNAL %d\n", WTERMSIG(status));
                         cl->fg_status = WTERMSIG(status);
                         cl->fg_exited = 0;
                         cl->fg_signaled = 1;
                     }
                     else if (WIFEXITED(status))
                     {
+                        //printf("~~EXIT %d\n", WEXITSTATUS(status));
                         cl->fg_status = WEXITSTATUS(status);
                         cl->fg_exited = 1;
                         cl->fg_signaled = 0;
+                    }
+                    else
+                    {
+                        //printf("~~NOT SIGNALED OR EXITED\n");
                     }
                 }
             }
@@ -495,11 +829,13 @@ int _execute_CL(struct CL * cl)
                 free(path_tmp);
             }
 
-            perror("\0");
-
             // following is only reached if execvp failed
             cl->fg_status = 1;
+            cl->is_child = 1;
             result = -1;
+
+            // print system error
+            perror(cl->args[0]);
             
             // close streams
             if (in_redir)  { close(in_stream);
@@ -573,7 +909,7 @@ _process_special_args(struct CL * cl, int * special_count,
             // check for open failure
             if (*in_stream == -1)
             {
-                perror("\0");
+                perror(cl->args[i+1]);
                 return 1;
             }
         }
@@ -592,7 +928,7 @@ _process_special_args(struct CL * cl, int * special_count,
             // check for open failure
             if (*out_stream == -1)
             {
-                perror("\0");
+                perror(cl->args[i+1]);
                 return 1;
             }
         }
@@ -611,7 +947,7 @@ _process_special_args(struct CL * cl, int * special_count,
             // check for open failure
             if (*out_stream == -1)
             {
-                perror("\0");
+                perror(cl->args[i+1]);
                 return 1;
             }
         }
@@ -838,11 +1174,6 @@ void _sigint_handler(int signum)
     fflush(stdout);
 }
 
-/* act assigned to sigchld invocation */
-void _sigchld_handler(int signum)
-{
-}
-
 /* act assigned to sigtstp invocation */
 void _sigtstp_handler(int signum)
 {
@@ -964,19 +1295,15 @@ int main(int argc, char** argv)
     // declare sigaction structs
     struct sigaction sigint_action  = {0};
     struct sigaction sigtstp_action = {0};
-    struct sigaction sigchld_action = {0};
 
     // set signal handlers
     sigint_action.sa_handler  = _sigint_handler;
     sigtstp_action.sa_handler = _sigtstp_handler;
-    sigchld_action.sa_handler = _sigchld_handler;
 
     // assign signal actions with sigaction
     //sigaction(SIGINT,  &sigint_action,  NULL);
     signal(SIGINT, SIG_IGN);
     sigaction(SIGTSTP, &sigtstp_action, NULL);
-    signal(SIGCHLD, SIG_IGN);
-    //sigaction(SIGCHLD, &sigchld_action, NULL);
 
     // command loop
     keep_going = 0;
@@ -989,7 +1316,7 @@ int main(int argc, char** argv)
         pid_check_CL(&cl);
 
         // get commands
-        if (get_input(in_buff, IN_BUFF_SIZE) != 0) { continue; };
+        if (get_input(&cl, in_buff, IN_BUFF_SIZE) != 0) { continue; };
 
         // run commands
         keep_going = run_CL(&cl, in_buff);
