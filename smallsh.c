@@ -94,6 +94,7 @@ void _sigint_handler(int signum);       // act on sigint during shell operation
 void _sigtstp_handler(int signum);      // act on sigtstp during shell operation
 int _add_to_hist(struct CL*, char*);    // add a command to the command history
 int _grow_history(struct CL*);          // grow history dynarr
+int _tab_complete(struct CL*, char*);   // update passed buffer w/ tab complete
 
 
 /*** built-in prototypes ***/
@@ -513,6 +514,34 @@ int _grow_history(struct CL * cl)
 
     // return
     return 0;
+}
+
+/* update passed buffer w/ tab complete
+ * pre-conditions:  cl is setup, buffer is null terminated */
+int _tab_complete(struct CL * cl, char * buffer)
+{
+    char * ptr;
+
+    if ((ptr = strstr(buffer, " ")) == NULL)
+    {
+        /* tab-complete the command */
+    }
+    else
+    {
+        /* tab-complete the last arg */
+        int size = 10;
+        int len = 0;
+        char ** matches = malloc(size * sizeof(char*));
+        int longest = 0;
+
+
+        // find last arg
+        while(strstr(buffer, " ") != NULL)
+            { ptr = strstr(buffer, " ") + 1; }
+
+        // at start of last arg
+        for(
+    }
 }
 
 
