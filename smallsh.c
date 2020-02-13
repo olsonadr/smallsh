@@ -540,7 +540,7 @@ int _tab_complete(struct CL * cl, char * buffer)
             { ptr = strstr(buffer, " ") + 1; }
 
         // at start of last arg
-        for(
+        //for(
     }
 }
 
