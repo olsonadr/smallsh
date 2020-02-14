@@ -10,7 +10,7 @@ make
 ```
 or
 ```bash
-gcc -o ./smallsh ./smallsh.c
+gcc -o ./smallsh ./src/smallsh.c
 ```
 
 ## Usage
