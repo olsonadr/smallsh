@@ -864,7 +864,9 @@ int _execute_CL(struct CL * cl)
             result = -1;
 
             // print system error
-            perror(cl->args[0]);
+            char perr[CL_BUFF_SIZE] = "smallsh: ";
+            sprintf(perr, "%s%s", perr, cl->args[0]);
+            perror(perr);
             
             // close streams
             if (in_redir)  { close(in_stream);
@@ -938,7 +940,9 @@ _process_special_args(struct CL * cl, int * special_count,
             // check for open failure
             if (*in_stream == -1)
             {
-                perror(cl->args[i+1]);
+                char perr[CL_BUFF_SIZE] = "smallsh: ";
+                sprintf(perr, "%s%s", perr, cl->args[i+1]);
+                perror(perr);
                 return 1;
             }
         }
@@ -957,7 +961,9 @@ _process_special_args(struct CL * cl, int * special_count,
             // check for open failure
             if (*out_stream == -1)
             {
-                perror(cl->args[i+1]);
+                char perr[CL_BUFF_SIZE] = "smallsh: ";
+                sprintf(perr, "%s%s", perr, cl->args[i+1]);
+                perror(perr);
                 return 1;
             }
         }
@@ -976,7 +982,9 @@ _process_special_args(struct CL * cl, int * special_count,
             // check for open failure
             if (*out_stream == -1)
             {
-                perror(cl->args[i+1]);
+                char perr[CL_BUFF_SIZE] = "smallsh: ";
+                sprintf(perr, "%s%s", perr, cl->args[i+1]);
+                perror(perr);
                 return 1;
             }
         }
