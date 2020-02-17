@@ -45,6 +45,8 @@ smallsh.c    smallsh    README.txt
     - If in foreground process, before next input (or if sitting at input, immediately) toggle a "foreground only mode" where the '&' special character is ignored (as if it were not inputted) and so new background processes may not be started
   - SIGINT
     - Ignored if sitting at prompt, signals foreground child to terminate if one is currently executing
+- Use vim Session to open project files
+  - Use "vim -S utils/Session.vim" from project root
 
 
 ## TODO
