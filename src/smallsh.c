@@ -94,7 +94,7 @@ void _sigint_handler(int signum);       // act on sigint during shell operation
 void _sigtstp_handler(int signum);      // act on sigtstp during shell operation
 int _add_to_hist(struct CL*, char*);    // add a command to the command history
 int _grow_history(struct CL*);          // grow history dynarr
-int _tab_complete(struct CL*, char*);   // update passed buffer w/ tab complete
+int _tab_complete(struct CL*, char*, int); // update passed buffer w/ tab complete
 
 
 /*** built-in prototypes ***/
@@ -518,29 +518,52 @@ int _grow_history(struct CL * cl)
 
 /* update passed buffer w/ tab complete
  * pre-conditions:  cl is setup, buffer is null terminated */
-int _tab_complete(struct CL * cl, char * buffer)
+int _tab_complete(struct CL * cl, char * buffer, int idx)
 {
     char * ptr;
+    char * end;
+    int size = 10;
+    int len = 0;
+    char ** matches = malloc(size * sizeof(char*));
+    int longest = 0;
+    struct dirent * ep;
+    //DIR * dp;
 
-    if ((ptr = strstr(buffer, " ")) == NULL)
+    // move to cursor
+    ptr = buffer + idx;
+
+    // ensure cursor is at end of word or buffer
+    if (strlen(buffer) != idx && *(ptr + 1) == ' ') { return 1; }
+
+    if ((ptr = strstr(buffer, " ")) != NULL)
     {
-        /* tab-complete the command */
-    }
-    else
-    {
-        /* tab-complete the last arg */
-        int size = 10;
-        int len = 0;
-        char ** matches = malloc(size * sizeof(char*));
-        int longest = 0;
-
-
         // find last arg
         while(strstr(buffer, " ") != NULL)
             { ptr = strstr(buffer, " ") + 1; }
+        end = strstr(buffer, " ");
+    }
+    else
+    {
+        ptr = buffer;
+    }
 
-        // at start of last arg
-        //for(
+    // at start of last arg or beginning
+    if (ptr == buffer)
+    {
+        /* complete command or file */
+        if (strlen(buffer) != 0 && buffer[0] == '.')
+        {
+            /* check check current dir */
+        }
+        else if (strlen(buffer) != 0)
+        {
+            /* match whatever is already there */
+        }
+    }
+    else
+    {
+        /* complete argument (file) */
+        
     }
 }
 
